@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>3D skeleton avatar – Dance Hack</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #0a0a12; color: #eee; font-family: system-ui, sans-serif; }
+    .toolbar {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      padding: 0.75rem 1rem;
+      background: rgba(0,0,0,0.7);
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+      z-index: 10;
+    }
+    .toolbar label { font-size: 0.9rem; cursor: pointer; }
+    .toolbar input[type="file"] { display: none; }
+    .toolbar button {
+      padding: 0.4rem 0.8rem;
+      border: 1px solid #0af;
+      background: #1a2a3a;
+      color: #0af;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 0.9rem;
+    }
+    .toolbar button:hover { background: #2a3a4a; }
+    .toolbar button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .toolbar .time { font-size: 0.85rem; opacity: 0.9; }
+    #canvas3d { display: block; width: 100%; height: 100vh; }
+    .hint {
+      position: fixed;
+      bottom: 1rem;
+      left: 50%;
+      transform: translateX(-50%);
+      padding: 0.5rem 1rem;
+      background: rgba(0,0,0,0.6);
+      border-radius: 8px;
+      font-size: 0.85rem;
+      opacity: 0.9;
+    }
+  </style>
+</head>
+<body>
+  <div class="toolbar">
+    <label>
+      <span style="border:1px solid #0af; padding:0.35rem 0.75rem; border-radius:6px;">Load pose JSON</span>
+      <input type="file" id="fileInput" accept=".json,application/json" />
+    </label>
+    <button type="button" id="btnPlay" disabled>Play</button>
+    <button type="button" id="btnPause" disabled>Pause</button>
+    <span class="time" id="timeDisplay">—</span>
+  </div>
+  <canvas id="canvas3d"></canvas>
+  <p class="hint" id="hint">Record motion in <a href="../skeleton-webcam-output/" style="color:#0af">skeleton-webcam-output</a>, download JSON, then load it here.</p>
+
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+    }
+  }
+  </script>
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+    const POSE_CONNECTIONS = [
+      [11, 12], [11, 13], [13, 15], [12, 14], [14, 16],
+      [11, 23], [12, 24], [23, 24], [23, 25], [25, 27], [27, 29], [27, 31],
+      [24, 26], [26, 28], [28, 30], [28, 32],
+      [0, 1], [1, 2], [2, 3], [3, 7], [0, 4], [4, 5], [5, 6], [6, 8],
+      [9, 10], [15, 17], [15, 19], [15, 21], [16, 18], [16, 20], [16, 22]
+    ];
+
+    const canvas = document.getElementById('canvas3d');
+    const fileInput = document.getElementById('fileInput');
+    const btnPlay = document.getElementById('btnPlay');
+    const btnPause = document.getElementById('btnPause');
+    const timeDisplay = document.getElementById('timeDisplay');
+    const hint = document.getElementById('hint');
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0a0a12);
+
+    const camera = new THREE.PerspectiveCamera(50, 1, 0.01, 100);
+    camera.position.set(0, 0.5, 2);
+    camera.lookAt(0, 0.3, 0);
+
+    const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+    renderer.setPixelRatio(window.devicePixelRatio);
+    renderer.setSize(window.innerWidth, window.innerHeight);
+
+    const controls = new OrbitControls(camera, canvas);
+    controls.target.set(0, 0.3, 0);
+    controls.enableDamping = true;
+
+    const ambient = new THREE.AmbientLight(0x404060);
+    scene.add(ambient);
+    const dir = new THREE.DirectionalLight(0xffffff, 0.8);
+    dir.position.set(2, 3, 2);
+    scene.add(dir);
+
+    const skeletonGroup = new THREE.Group();
+    skeletonGroup.rotation.x = Math.PI;
+    scene.add(skeletonGroup);
+
+    let bodyMeshes = [];
+    let recording = null;
+    let currentFrameIndex = 0;
+    let playing = false;
+    let clock = new THREE.Clock();
+    let lastFrameTime = 0;
+
+    const SCALE = 1.2;
+    const skinMat = new THREE.MeshPhongMaterial({
+      color: 0xedb894,
+      shininess: 25,
+      flatShading: true
+    });
+
+    const BODY_PARTS = [
+      { type: 'torso', radius: 0.09 },
+      { type: 'head', radius: 0.07 },
+      { start: 11, end: 13, radius: 0.04 },
+      { start: 12, end: 14, radius: 0.04 },
+      { start: 13, end: 15, radius: 0.032 },
+      { start: 14, end: 16, radius: 0.032 },
+      { start: 23, end: 25, radius: 0.05 },
+      { start: 24, end: 26, radius: 0.05 },
+      { start: 25, end: 27, radius: 0.038 },
+      { start: 26, end: 28, radius: 0.038 }
+    ];
+
+    const _v0 = new THREE.Vector3();
+    const _v1 = new THREE.Vector3();
+    const _mid = new THREE.Vector3();
+    const _up = new THREE.Vector3(0, 1, 0);
+
+    function getPt(world, i) {
+      const p = world[i];
+      return _v0.set(
+        (p[0] != null ? p[0] : p.x) * SCALE,
+        (p[1] != null ? p[1] : p.y) * SCALE,
+        (p[2] != null ? p[2] : p.z) * SCALE
+      );
+    }
+
+    function createSkeletonMeshes() {
+      const cylGeo = new THREE.CylinderGeometry(1, 1, 1, 12);
+      const sphereGeo = new THREE.SphereGeometry(1, 16, 12);
+      for (let i = 0; i < BODY_PARTS.length; i++) {
+        const part = BODY_PARTS[i];
+        const mesh = part.type === 'head'
+          ? new THREE.Mesh(sphereGeo.clone(), skinMat.clone())
+          : new THREE.Mesh(cylGeo.clone(), skinMat.clone());
+        bodyMeshes.push(mesh);
+        skeletonGroup.add(mesh);
+      }
+    }
+
+    function updateSkeletonFromWorld(world) {
+      if (!world || world.length < 33 || bodyMeshes.length === 0) return;
+      for (let i = 0; i < BODY_PARTS.length; i++) {
+        const part = BODY_PARTS[i];
+        const mesh = bodyMeshes[i];
+        if (part.type === 'torso') {
+          getPt(world, 11);
+          _mid.copy(_v0);
+          getPt(world, 12);
+          _mid.add(_v0).multiplyScalar(0.5);
+          getPt(world, 23);
+          _v1.copy(_v0);
+          getPt(world, 24);
+          _v1.add(_v0).multiplyScalar(0.5);
+          const dist = _mid.distanceTo(_v1);
+          if (dist < 0.001) continue;
+          mesh.position.lerpVectors(_mid, _v1, 0.5);
+          mesh.scale.set(part.radius * 2, dist, part.radius * 2);
+          _v1.sub(_mid).normalize();
+          mesh.quaternion.setFromUnitVectors(_up, _v1);
+        } else if (part.type === 'head') {
+          getPt(world, 0);
+          mesh.position.copy(_v0);
+          mesh.scale.setScalar(part.radius);
+        } else {
+          getPt(world, part.start);
+          _mid.copy(_v0);
+          getPt(world, part.end);
+          const dist = _mid.distanceTo(_v0);
+          if (dist < 0.001) continue;
+          mesh.position.lerpVectors(_mid, _v0, 0.5);
+          mesh.scale.set(part.radius * 2, dist, part.radius * 2);
+          _v0.sub(_mid).normalize();
+          mesh.quaternion.setFromUnitVectors(_up, _v0);
+        }
+      }
+    }
+
+    function loadRecording(obj) {
+      const raw = obj.frames != null ? obj.frames : obj;
+      if (!Array.isArray(raw) || raw.length === 0) {
+        console.warn('No frames in JSON');
+        return false;
+      }
+      recording = raw.map(function(f, i) {
+        return {
+          t: f.t != null ? f.t : i / 30,
+          world: f.world || f
+        };
+      });
+      currentFrameIndex = 0;
+      lastFrameTime = 0;
+      if (recording[0] && recording[0].world) {
+        updateSkeletonFromWorld(recording[0].world);
+      }
+      btnPlay.disabled = false;
+      btnPause.disabled = false;
+      timeDisplay.textContent = '0 / ' + recording.length + ' frames';
+      hint.style.display = 'none';
+      return true;
+    }
+
+    fileInput.addEventListener('change', function() {
+      const file = fileInput.files && fileInput.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = function() {
+        try {
+          const obj = JSON.parse(reader.result);
+          if (loadRecording(obj)) {
+            timeDisplay.textContent = 'Loaded ' + recording.length + ' frames';
+          }
+        } catch (e) {
+          console.error(e);
+          timeDisplay.textContent = 'Invalid JSON';
+        }
+      };
+      reader.readAsText(file);
+    });
+
+    btnPlay.addEventListener('click', function() {
+      playing = true;
+      clock.start();
+      lastFrameTime = 0;
+    });
+    btnPause.addEventListener('click', function() {
+      playing = false;
+    });
+
+    function animate() {
+      requestAnimationFrame(animate);
+      const dt = clock.getDelta();
+      if (playing && recording && recording.length > 0) {
+        lastFrameTime += dt;
+        const fps = 30;
+        const frameTime = 1 / fps;
+        const totalTime = recording.length * frameTime;
+        const t = lastFrameTime % totalTime;
+        const index = Math.min(Math.floor(t / frameTime), recording.length - 1);
+        currentFrameIndex = index;
+        const frame = recording[index];
+        if (frame && frame.world) updateSkeletonFromWorld(frame.world);
+        timeDisplay.textContent = (index + 1) + ' / ' + recording.length + ' frames';
+      }
+      controls.update();
+      renderer.render(scene, camera);
+    }
+
+    createSkeletonMeshes();
+    animate();
+
+    window.addEventListener('resize', function() {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+  </script>
+</body>
+</html>

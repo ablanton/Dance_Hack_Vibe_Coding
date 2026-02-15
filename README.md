@@ -1,4 +1,4 @@
-# Dance Hack – Good Vibrations 🕺✨
+# Dance Hack
 
 **Vibe coding for creative performance & dance environments.**
 

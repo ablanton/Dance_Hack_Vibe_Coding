@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Avatar viewer (Mixamo) – Dance Hack</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #0a0a12; color: #eee; font-family: system-ui, sans-serif; overflow: hidden; }
+    #canvas3d { display: block; width: 100%; height: 100vh; }
+    .waiting {
+      position: fixed;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      padding: 1.5rem 2rem;
+      background: rgba(0,0,0,0.75);
+      border-radius: 12px;
+      text-align: center;
+      z-index: 5;
+      max-width: 90%;
+    }
+    .waiting.hidden { display: none; }
+    .waiting a { color: #0af; }
+    .load-status { position: fixed; top: 1rem; left: 1rem; font-size: 0.85rem; z-index: 5; }
+  </style>
+</head>
+<body>
+  <canvas id="canvas3d"></canvas>
+  <div class="waiting" id="waiting">
+    <p><strong>Waiting for stream</strong></p>
+    <p>Open <a href="../skeleton-webcam-output/">skeleton-webcam-output</a>, check <strong>Stream to avatar</strong>, then move in front of the camera.</p>
+    <p><small>Place <code>Ch36_nonPBR.fbx</code> in this folder (or repo root). Same origin required.</small></p>
+  </div>
+  <div class="load-status" id="loadStatus">Loading character…</div>
+
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+    }
+  }
+  </script>
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+    import { FBXLoader } from 'three/addons/loaders/FBXLoader.js';
+
+    const canvas = document.getElementById('canvas3d');
+    const waitingEl = document.getElementById('waiting');
+    const loadStatusEl = document.getElementById('loadStatus');
+
+    const SCALE = 1.2;
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0a0a12);
+
+    const camera = new THREE.PerspectiveCamera(50, 1, 0.01, 100);
+    // View from in front of the character (MediaPipe person faces the camera, so we look from -Z)
+    camera.position.set(0, 0.5, -2);
+    camera.lookAt(0, 0.3, 0);
+
+    const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+    renderer.setPixelRatio(window.devicePixelRatio);
+    renderer.setSize(window.innerWidth, window.innerHeight);
+
+    const controls = new OrbitControls(camera, canvas);
+    controls.target.set(0, 0.3, 0);
+    controls.enableDamping = true;
+
+    scene.add(new THREE.AmbientLight(0x404060));
+    const dir = new THREE.DirectionalLight(0xffffff, 0.8);
+    dir.position.set(2, 3, 2);
+    scene.add(dir);
+
+    let model = null;
+    let skeleton = null;
+    let rootBone = null;
+    const boneByName = {};
+    const _hipCenter = new THREE.Vector3();
+    const _restDir = new THREE.Vector3();
+    const _desiredDir = new THREE.Vector3();
+    const _quat = new THREE.Quaternion();
+
+    // MediaPipe: X right, Y down, Z toward camera. We flip Y (up) and Z (so forward = toward our camera at -Z).
+    // Order matters: parents before children so world quaternions are correct when we transform to parent space.
+    const BONE_TO_LANDMARKS = [
+      { names: ['spine', 'mixamorigspine'], fromMid: [23, 24], toMid: [11, 12] },
+      { names: ['spine1', 'mixamorigspine1'], fromMid: [23, 24], toMid: [11, 12] },
+      { names: ['spine2', 'mixamorigspine2'], fromMid: [23, 24], toMid: [11, 12] },
+      { names: ['neck', 'mixamorigneck'], fromMid: [11, 12], toLandmark: 0 },
+      { names: ['head', 'mixamorighead'], fromMid: [11, 12], toLandmark: 0 },
+      { names: ['leftarm', 'leftupperarm', 'mixamorigleftarm'], start: 11, end: 13 },
+      { names: ['rightarm', 'rightupperarm', 'mixamorigrightarm'], start: 12, end: 14 },
+      { names: ['leftforearm', 'leftlowerarm', 'mixamorigleftforearm'], start: 13, end: 15 },
+      { names: ['rightforearm', 'rightlowerarm', 'mixamorigrightforearm'], start: 14, end: 16 },
+      { names: ['leftupleg', 'leftthigh', 'mixamorigleftupleg'], start: 23, end: 25 },
+      { names: ['rightupleg', 'rightthigh', 'mixamorigrightupleg'], start: 24, end: 26 },
+      { names: ['leftleg', 'leftshin', 'mixamorigleftleg'], start: 25, end: 27 },
+      { names: ['rightleg', 'rightshin', 'mixamorigrightleg'], start: 26, end: 28 }
+    ];
+    let limbBones = [];
+    const _midA = new THREE.Vector3();
+    const _midB = new THREE.Vector3();
+
+    function getLandmarkPt(world, i) {
+      const p = world[i];
+      return new THREE.Vector3(
+        (p[0] != null ? p[0] : p.x) * SCALE,
+        (p[1] != null ? p[1] : p.y) * SCALE,
+        (p[2] != null ? p[2] : p.z) * SCALE
+      );
+    }
+
+    function findBones(obj) {
+      if (obj.isBone) {
+        boneByName[obj.name] = obj;
+        const name = (obj.name || '').toLowerCase();
+        if (!rootBone && (name.includes('hip') || (obj.parent && !obj.parent.isBone)))
+          rootBone = obj;
+      }
+      if (obj.isSkinnedMesh && obj.skeleton && !skeleton)
+        skeleton = obj.skeleton;
+      for (let i = 0; i < obj.children.length; i++)
+        findBones(obj.children[i]);
+    }
+
+    function getStartEnd(world, map) {
+      if (map.fromMid != null) {
+        _midA.copy(getLandmarkPt(world, map.fromMid[0])).add(getLandmarkPt(world, map.fromMid[1])).multiplyScalar(0.5);
+        if (map.toMid != null)
+          _midB.copy(getLandmarkPt(world, map.toMid[0])).add(getLandmarkPt(world, map.toMid[1])).multiplyScalar(0.5);
+        else
+          _midB.copy(getLandmarkPt(world, map.toLandmark));
+        return { startPt: _midA, endPt: _midB };
+      }
+      return { startPt: getLandmarkPt(world, map.start), endPt: getLandmarkPt(world, map.end) };
+    }
+
+    function buildLimbBones() {
+      for (const map of BONE_TO_LANDMARKS) {
+        for (const key of Object.keys(boneByName)) {
+          const k = key.toLowerCase();
+          if (map.names.some(function(n) { return k.includes(n.replace(' ', '')); })) {
+            const bone = boneByName[key];
+            if (bone.children.length > 0) {
+              _restDir.copy(bone.children[0].position).normalize();
+              limbBones.push({ bone, map, restDir: _restDir.clone() });
+            }
+            break;
+          }
+        }
+      }
+    }
+
+    function loadCharacter() {
+      const paths = ['./Ch36_nonPBR.fbx', '../Ch36_nonPBR.fbx', '../../Ch36_nonPBR.fbx'];
+      let tried = 0;
+      function tryLoad(idx) {
+        if (idx >= paths.length) {
+          loadStatusEl.textContent = 'No FBX found. Place Ch36_nonPBR.fbx in this folder or repo root.';
+          return;
+        }
+        const loader = new FBXLoader();
+        loader.load(paths[idx], function(fbx) {
+          model = fbx;
+          model.rotation.x = 0;
+          model.scale.setScalar(0.006);
+          findBones(model);
+          if (skeleton) {
+            if (!rootBone) rootBone = skeleton.bones[0];
+            buildLimbBones();
+            loadStatusEl.textContent = 'Character loaded (' + limbBones.length + ' limbs). Waiting for pose stream…';
+            scene.add(model);
+          } else {
+            loadStatusEl.textContent = 'Loaded but no skeleton found.';
+            scene.add(model);
+          }
+        }, undefined, function() {
+          tried++;
+          tryLoad(idx + 1);
+        });
+      }
+      tryLoad(0);
+    }
+
+    function updatePoseFromWorld(world) {
+      if (!world || world.length < 33) return;
+      if (!model) return;
+
+      const p23 = getLandmarkPt(world, 23);
+      const p24 = getLandmarkPt(world, 24);
+      _hipCenter.copy(p23).add(p24).multiplyScalar(0.5);
+      _hipCenter.y = -_hipCenter.y;   // MediaPipe Y down -> Three.js Y up
+      _hipCenter.z = -_hipCenter.z;   // MediaPipe Z toward camera -> our camera is at -Z
+      model.position.copy(_hipCenter);
+
+      for (let i = 0; i < limbBones.length; i++) {
+        const { bone, map, restDir } = limbBones[i];
+        const { startPt, endPt } = getStartEnd(world, map);
+        _desiredDir.subVectors(endPt, startPt);
+        _desiredDir.y = -_desiredDir.y;  // MediaPipe Y down -> Three.js Y up
+        _desiredDir.z = -_desiredDir.z; // forward toward camera in pose -> -Z in scene
+        if (_desiredDir.length() < 0.01) continue;
+        _desiredDir.normalize();
+        if (bone.parent) {
+          _quat.copy(bone.parent.getWorldQuaternion(_quat)).invert();
+          _desiredDir.applyQuaternion(_quat);
+        }
+        _quat.setFromUnitVectors(restDir, _desiredDir);
+        bone.quaternion.copy(_quat);
+      }
+
+      if (skeleton)
+        skeleton.updateMatrixWorld(true);
+    }
+
+    loadCharacter();
+
+    const channel = new BroadcastChannel('dancehack-pose');
+    channel.onmessage = function(e) {
+      if (e.data && e.data.world) {
+        waitingEl.classList.add('hidden');
+        updatePoseFromWorld(e.data.world);
+      }
+    };
+
+    function animate() {
+      requestAnimationFrame(animate);
+      controls.update();
+      renderer.render(scene, camera);
+    }
+    animate();
+
+    window.addEventListener('resize', function() {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+  </script>
+</body>
+</html>
