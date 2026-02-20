@@ -6,6 +6,8 @@ A workshop at **UC Berkeley**, hosted at **CNMAT** — **February 20th**. We’l
 
 ---
 
+Etherpad :: https://pad.riseup.net/p/iRXYwtwSlNMkvF2Ro3cp-keep
+
 **New to the repo?** → [Getting started (install Cursor & open this project)](GettingStarted.md)
 
 **Building creative apps?** → [Agent guidance (creating & structuring examples)](AGENTS.md)
